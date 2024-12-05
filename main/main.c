@@ -21,7 +21,11 @@
 #define VOLTAGE_SENSOR_ADC_CHANNEL ADC_CHANNEL_6 // GPIO34
 #define CURRENT_SENSOR_ADC_CHANNEL ADC_CHANNEL_7 // GPIO35
 
-static const char* TAG = "monitor-esp32";
+static const char* ESP_TAG = "monitor-esp32:MAIN";
+static const char* WIFI_TAG = "monitor-esp32:WIFI";
+static const char* ADC_TAG = "monitor-esp32:ADC";
+static const char* HTTP_TAG = "monitor-esp32:HTTP";
+
 static char mac_str[18];
 static EventGroupHandle_t s_wifi_event_group;
 
@@ -58,9 +62,9 @@ void app_main(void) {
                                            portMAX_DELAY);
 
     if (bits & WIFI_CONNECTED_BIT) {
-        ESP_LOGI(TAG, "Connected to Wi-Fi!");
+        ESP_LOGI(WIFI_TAG, "Connected to Wi-Fi!");
     } else {
-        ESP_LOGI(TAG, "Failed to connect to Wi-Fi.");
+        ESP_LOGI(WIFI_TAG, "Failed to connect to Wi-Fi.");
     }
 
 	//=
@@ -77,13 +81,13 @@ void app_main(void) {
 static void get_mac_address(uint8_t* mac, char* mac_str) {
 	if (esp_efuse_mac_get_default(mac) == ESP_OK) {
 		ESP_LOGI(
-			TAG,
+			ESP_TAG,
 			"Default EFUSE MAC address: %02X:%02X:%02X:%02X:%02X:%02X",
 			mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]
 		);
 	} else {
-		// TODO: decidir como tratar falha na obtenção do endereço MAC
-		ESP_LOGW(TAG, "Failed to read device tag");
+		// TODO: decide what to do on failing to read the MAC address
+		ESP_LOGW(ESP_TAG, "Failed to read device tag");
 	}
 	snprintf(mac_str, 18, "%02X:%02X:%02X:%02X:%02X:%02X", mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
 }
@@ -92,11 +96,11 @@ static void wifi_event_handler(void* arg, esp_event_base_t event_base, int32_t e
     if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
         esp_wifi_connect();
     } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
-        ESP_LOGI(TAG, "Disconnected from Wi-Fi, reconnecting...");
+        ESP_LOGI(WIFI_TAG, "Disconnected from Wi-Fi, reconnecting...");
         esp_wifi_connect();
     } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
         ip_event_got_ip_t* event = (ip_event_got_ip_t *)event_data;
-        ESP_LOGI(TAG, "Got IP: " IPSTR, IP2STR(&event->ip_info.ip));
+        ESP_LOGI(WIFI_TAG, "Got IP: " IPSTR, IP2STR(&event->ip_info.ip));
         xEventGroupSetBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
     }
 }
@@ -137,7 +141,7 @@ static void wifi_init_sta(void) {
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
     ESP_ERROR_CHECK(esp_wifi_start());
 
-    ESP_LOGI(TAG, "Wi-Fi initialization completed.");
+    ESP_LOGI(WIFI_TAG, "Wi-Fi initialization completed.");
 }
 
 static void setup_adc(void) {
@@ -155,51 +159,70 @@ static void setup_adc(void) {
 	ESP_ERROR_CHECK(adc_oneshot_config_channel(adc_handle, CURRENT_SENSOR_ADC_CHANNEL, &adc_channel_config));
 }
 
+static bool calibrate_adc(void) {
+    adc_cali_line_fitting_config_t  cali_config = {
+        .unit_id = ADC_UNIT_1,
+        .atten = ADC_ATTEN_DB_12,
+        .bitwidth = ADC_BITWIDTH_DEFAULT,
+    };
+
+    esp_err_t ret = adc_cali_create_scheme_line_fitting(&cali_config, &adc_cali_handle);
+    if (ret == ESP_OK) {
+        ESP_LOGI(ADC_TAG, "ADC calibration initialized successfully.");
+        return true;
+    } else if (ret == ESP_ERR_NOT_SUPPORTED) {
+        ESP_LOGI(ADC_TAG, "Curve-fitting calibration scheme not supported. ADC readings might be less accurate.");
+    } else {
+        ESP_LOGI(ADC_TAG, "Failed to initialize ADC calibration.\n");
+    }
+    return false;
+}
+
 static void read_adc_values(void) {
     int raw_voltage = 0;
     int raw_current = 0;
 
     ESP_ERROR_CHECK(adc_oneshot_read(adc_handle, VOLTAGE_SENSOR_ADC_CHANNEL, &raw_voltage));
-    ESP_LOGI(TAG, "Raw Voltage ADC Value: %d", raw_voltage);
+    ESP_LOGI(ADC_TAG, "Raw Voltage ADC Value: %d", raw_voltage);
 
     ESP_ERROR_CHECK(adc_oneshot_read(adc_handle, CURRENT_SENSOR_ADC_CHANNEL, &raw_current));
-    ESP_LOGI(TAG, "Raw Current ADC Value: %d", raw_current);
+    ESP_LOGI(ADC_TAG, "Raw Current ADC Value: %d", raw_current);
 
-    mv = (uint32_t)((raw_voltage * 3.3 / 4096) * 1000);
+    adc_cali_raw_to_voltage(adc_cali_handle, raw_voltage,&mv);
 
-	static const uint16_t current_sensor_zero_offset = 0;
+	static const uint16_t current_sensor_zero_offset = 112; // Temporary until we measure the actual offset
 	static const double k = 0.04028320312; // (Vref / 4096) / ((Vsupply / 3.3) * (20 / 1000))
-    ma = (uint32_t)((raw_current - current_sensor_zero_offset) * k * 1000);
+    ma = (int)((raw_current - current_sensor_zero_offset) * k * 1000);
 
-    ESP_LOGI(TAG, "Voltage: %zu mV, Current: %zu mA", mv, ma);
+    ESP_LOGI(ADC_TAG, "Voltage: %zu mV, Current: %zu mA", mv, ma);
 }
 
 static esp_err_t http_event_handler(esp_http_client_event_t* evt) {
     switch (evt->event_id) {
         case HTTP_EVENT_ERROR:
-            ESP_LOGI(TAG, "HTTP_EVENT_ERROR");
+            ESP_LOGI(HTTP_TAG, "Event: HTTP_EVENT_ERROR");
             break;
         case HTTP_EVENT_ON_CONNECTED:
-            ESP_LOGI(TAG, "HTTP_EVENT_ON_CONNECTED");
+            ESP_LOGI(HTTP_TAG, "Event: HTTP_EVENT_ON_CONNECTED");
             break;
         case HTTP_EVENT_HEADER_SENT:
-            ESP_LOGI(TAG, "HTTP_EVENT_HEADER_SENT");
+            ESP_LOGI(HTTP_TAG, "Event: HTTP_EVENT_HEADER_SENT");
             break;
         case HTTP_EVENT_ON_HEADER:
-            ESP_LOGI(TAG, "HTTP_EVENT_ON_HEADER, key=%s, value=%s",
+            ESP_LOGI(HTTP_TAG, "Event: HTTP_EVENT_ON_HEADER, key=%s, value=%s",
                      evt->header_key, evt->header_value);
             break;
         case HTTP_EVENT_ON_DATA:
-            ESP_LOGI(TAG, "HTTP_EVENT_ON_DATA, len=%d", evt->data_len);
+            ESP_LOGI(HTTP_TAG, "Event: HTTP_EVENT_ON_DATA, len=%d", evt->data_len);
             break;
         case HTTP_EVENT_ON_FINISH:
-            ESP_LOGI(TAG, "HTTP_EVENT_ON_FINISH");
+            ESP_LOGI(HTTP_TAG, "Event: HTTP_EVENT_ON_FINISH");
             break;
         case HTTP_EVENT_DISCONNECTED:
-            ESP_LOGI(TAG, "HTTP_EVENT_DISCONNECTED");
+            ESP_LOGI(HTTP_TAG, "Event: HTTP_EVENT_DISCONNECTED");
             break;
 		default:
-			ESP_LOGW(TAG, "Unhandled HTTP event");
+			ESP_LOGW(HTTP_TAG, "Unhandled HTTP event");
 			return ESP_FAIL;
     }
     return ESP_OK;
@@ -214,7 +237,7 @@ static void send_post_request(void) {
 
     char post_data[128];
     snprintf(post_data, sizeof(post_data), "{\"mac\":\"%s\",\"mv\":%d,\"ma\":%d}", mac_str, mv, ma);
-    ESP_LOGI(TAG, "POST JSON: %s", post_data);
+    ESP_LOGI(HTTP_TAG, "POST: JSON data: %s", post_data);
 
     esp_http_client_set_method(client, HTTP_METHOD_POST);
     esp_http_client_set_header(client, "Content-Type", "application/json");
@@ -222,10 +245,10 @@ static void send_post_request(void) {
 
     esp_err_t err = esp_http_client_perform(client);
     if (err == ESP_OK) {
-        ESP_LOGI(TAG, "POST successful, Status = %d",
+        ESP_LOGI(HTTP_TAG, "POST: POST successful, Status = %d",
                  esp_http_client_get_status_code(client));
     } else {
-        ESP_LOGE(TAG, "POST failed: %s", esp_err_to_name(err));
+        ESP_LOGE(HTTP_TAG, "POST: POST failed: %s", esp_err_to_name(err));
     }
 
     esp_http_client_cleanup(client);
@@ -233,9 +256,9 @@ static void send_post_request(void) {
 
 static void post_task(void* pvParameters) {
     while (1) {
-		ESP_LOGI(TAG, "Reading ADC values...");
+		ESP_LOGI(ADC_TAG, "Reading ADC values...");
 		read_adc_values();
-        ESP_LOGI(TAG, "Sending POST request...");
+        ESP_LOGI(HTTP_TAG, "Sending POST request...");
         send_post_request();
         vTaskDelay(pdMS_TO_TICKS(10000));
     }
