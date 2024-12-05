@@ -1,0 +1,3 @@
+/.dist/
+/.vscode/
+/include/secrets.h
