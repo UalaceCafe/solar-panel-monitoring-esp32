@@ -29,13 +29,15 @@ static const char* HTTP_TAG = "monitor-esp32:HTTP";
 static char mac_str[18];
 static EventGroupHandle_t s_wifi_event_group;
 
+static adc_cali_handle_t adc_cali_handle = NULL;
 static adc_oneshot_unit_handle_t adc_handle;
-static uint32_t mv = 0, ma = 0;
+static int mv = 0, ma = 0;
 
 static void get_mac_address(uint8_t* mac, char* mac_str);
 static void wifi_event_handler(void* arg, esp_event_base_t event_base, int32_t event_id, void* event_data);
 static void wifi_init_sta(void);
 static void setup_adc(void);
+static bool calibrate_adc(void);
 static void read_adc_values(void);
 static esp_err_t http_event_handler(esp_http_client_event_t* evt);
 static void send_post_request(void);
@@ -68,8 +70,9 @@ void app_main(void) {
     }
 
 	//=
-	// * ADCs
+	// * Calibrate and setup ADCs
 	//=
+	calibrate_adc();
 	setup_adc();
 
 	//=
